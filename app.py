@@ -1,14 +1,16 @@
 # app_spo2.py
 # DN pro - SpO2 (E-based) | step = 1 minute
-# Spec-locked behavior:
-# - Encode E from raw SpO2 (good=100, bad=88, clip T in [0,1]) then compute vE/Drop
-# - ON* if E==0 (LIMIT_E0)
-# - ON if Drop > s (DROP_EVENT), s=0.30
-# - ON if VERY_LOW streak hits 3 (VERY_LOW_PERSIST)
-# - ON if LOW streak hits 5 (LOW_PERSIST)
-# - Reset streaks when E >= E_RESET (0.5556) or E==0
-# - OFF otherwise (NO_TRIGGER). 'flat' note if |vE|<=p, p=0.01
-# Output has no counters.
+# Locked mapping: good=100, bad=88, T clipped to [0,1], E = 1 - T^2
+#
+# ON/OFF rules (E-based):
+# 1) LIMIT_E0: if E == 0 -> Alert = ON* (highest priority)
+# 2) DROP_EVENT: if Drop > s -> Alert = ON
+# 3) VERY_LOW_PERSIST: if very-low streak hits 3 -> Alert = ON, then HOLD ON for 5 minutes
+# 4) LOW_PERSIST: if low streak hits 5 -> Alert = ON, then HOLD ON for 3 minutes
+# 5) Otherwise OFF (NO_TRIGGER). Note 'flat' if |vE|<=p.
+#
+# Persistence reset when E >= E_RESET or when E == 0.
+# Early OFF: if hold is active and E leaves its band or E>=E_RESET.
 
 from __future__ import annotations
 
@@ -29,16 +31,21 @@ DENOM = (GOOD_SPO2 - BAD_SPO2)  # 12.0
 S_DROP = 0.30  # Drop > s => ON (DROP_EVENT)
 P_FLAT = 0.01  # |vE| <= p => flat note
 
-# E thresholds (locked numeric per your spec)
+# E thresholds (locked numeric per spec)
 E_RESET = 0.5556      # reset persistence when E >= this (≈ E at SpO2=92)
 E_VLOW = 0.1597       # very-low boundary (≈ E at SpO2=89)
-E_LOW_MAX = 0.4375    # low boundary (≈ E at SpO2=91)
+E_LOW_MAX = 0.4375    # low max boundary (≈ E at SpO2=91)
 
+# Trigger streak lengths (locked per spec)
 N_VLOW = 3
 N_LOW = 5
 
+# Hold lengths (per your latest correction: very-low holds longer than low)
+HOLD_VLOW = 5  # minutes
+HOLD_LOW = 3   # minutes
+
 MAX_POINTS = 100
-EPS = 1e-9  # numeric stability for comparisons
+EPS = 1e-9
 
 
 @dataclass
@@ -90,14 +97,15 @@ def spo2_to_e(spo2: int) -> float:
 
 def compute_table(spo2_raw: List[int]) -> pd.DataFrame:
     rows: List[RowOut] = []
-
     prev_e: Optional[float] = None
 
-    # Persistence counters (internal only; NOT exported)
-    # low_streak counts minutes where 0 < E <= E_LOW_MAX
-    # vlow_streak counts minutes where 0 < E <= E_VLOW
+    # Internal persistence streak counters (NOT exported)
     low_streak = 0
     vlow_streak = 0
+
+    # Hold state (NOT exported)
+    hold_left = 0            # minutes left to keep ON
+    hold_reason = ""         # "VERY_LOW_PERSIST" or "LOW_PERSIST"
 
     for i, raw in enumerate(spo2_raw, start=1):
         e = spo2_to_e(raw)
@@ -114,70 +122,117 @@ def compute_table(spo2_raw: List[int]) -> pd.DataFrame:
             if abs(ve) <= P_FLAT + EPS:
                 note_parts.append("flat (|vE|<=p)")
 
-        # ---------- Reset rules ----------
-        # Reset persistence when reserve recovers (E >= E_RESET)
+        # -------------------------
+        # Priority 1: LIMIT_E0 (E==0) -> ON* immediate
+        # -------------------------
+        if e <= 0.0 + EPS:
+            # Reset all internal states (new episode)
+            low_streak = 0
+            vlow_streak = 0
+            hold_left = 0
+            hold_reason = ""
+
+            rows.append(
+                RowOut(
+                    minute=i,
+                    spo2=int(raw),
+                    e=float(e),
+                    ve=None if ve is None else float(ve),
+                    drop=None if drop is None else float(drop),
+                    alert="ON*",
+                    reason="LIMIT_E0",
+                    note="; ".join(note_parts),
+                )
+            )
+            prev_e = e
+            continue
+
+        # -------------------------
+        # Reset rule on recovery
+        # -------------------------
         if e >= E_RESET - EPS:
             low_streak = 0
             vlow_streak = 0
+            if hold_left > 0:
+                note_parts.append("hold cancelled (E>=E_reset)")
+            hold_left = 0
+            hold_reason = ""
             note_parts.append("reset (E>=E_reset)")
 
-        # Reset also when LIMIT (E==0): new episode boundary
-        if e <= 0.0 + EPS:
-            low_streak = 0
-            vlow_streak = 0
-
-        # ---------- Update streaks (E-based) ----------
-        # Only count persistence in low/very-low when E is above 0 (limit handled separately)
-        if e > 0.0 + EPS:
-            # LOW band for 5-min rule: 0 < E <= E_LOW_MAX
-            if e <= E_LOW_MAX + EPS:
-                low_streak += 1
-            else:
-                low_streak = 0
-
-            # VERY-LOW band for 3-min rule: 0 < E <= E_VLOW
-            if e <= E_VLOW + EPS:
-                vlow_streak += 1
-            else:
-                vlow_streak = 0
+        # -------------------------
+        # Update streaks (E-based)
+        # -------------------------
+        # LOW band: 0 < E <= E_LOW_MAX
+        if e <= E_LOW_MAX + EPS:
+            low_streak += 1
         else:
-            # at limit
             low_streak = 0
+
+        # VERY-LOW band: 0 < E <= E_VLOW
+        if e <= E_VLOW + EPS:
+            vlow_streak += 1
+        else:
             vlow_streak = 0
 
-        # Optional note (no counters shown)
-        if e > 0.0 + EPS:
-            if e <= E_VLOW + EPS and vlow_streak < N_VLOW:
-                note_parts.append("counting very-low persistence")
-            elif e <= E_LOW_MAX + EPS and low_streak < N_LOW:
-                note_parts.append("counting low persistence")
+        # optional note (no counters)
+        if e <= E_VLOW + EPS and vlow_streak < N_VLOW:
+            note_parts.append("counting very-low persistence")
+        elif (e > E_VLOW + EPS) and (e <= E_LOW_MAX + EPS) and low_streak < N_LOW:
+            note_parts.append("counting low persistence")
 
-        # ---------- Decide Alert/Reason (priority) ----------
+        # -------------------------
+        # Early OFF for hold if reserve leaves the band
+        # -------------------------
+        if hold_left > 0:
+            if hold_reason == "VERY_LOW_PERSIST" and e > E_VLOW + EPS:
+                note_parts.append("hold ended early (E>very-low)")
+                hold_left = 0
+                hold_reason = ""
+            elif hold_reason == "LOW_PERSIST" and e > E_LOW_MAX + EPS:
+                note_parts.append("hold ended early (E>low)")
+                hold_left = 0
+                hold_reason = ""
+
+        # -------------------------
+        # Decide Alert/Reason
+        # -------------------------
         alert = "OFF"
         reason = "NO_TRIGGER"
+        triggered_now = False
 
-        # Priority 1: LIMIT_E0 (E == 0)
-        if e <= 0.0 + EPS:
-            alert = "ON*"
-            reason = "LIMIT_E0"
-
-        # Priority 2: DROP_EVENT (Drop > s)
-        elif drop is not None and drop > S_DROP:
+        # Priority 2: DROP_EVENT
+        if drop is not None and drop > S_DROP:
             alert = "ON"
             reason = "DROP_EVENT"
+            triggered_now = True
 
-        # Priority 3: VERY_LOW_PERSIST trigger (exact hit == 3)
+        # Priority 3: VERY_LOW_PERSIST trigger at the HIT moment (==3)
         elif vlow_streak == N_VLOW:
+            hold_left = HOLD_VLOW
+            hold_reason = "VERY_LOW_PERSIST"
             alert = "ON"
             reason = "VERY_LOW_PERSIST"
+            triggered_now = True
 
-        # Priority 4: LOW_PERSIST trigger (exact hit == 5)
-        elif low_streak == N_LOW:
+        # Priority 4: LOW_PERSIST trigger at the HIT moment (==5), only when not very-low
+        elif low_streak == N_LOW and e > E_VLOW + EPS:
+            hold_left = HOLD_LOW
+            hold_reason = "LOW_PERSIST"
             alert = "ON"
             reason = "LOW_PERSIST"
+            triggered_now = True
 
-        # OFF otherwise
-        # Note already includes 'flat' or 'counting...' or 'reset...'
+        # If no new trigger, but hold active -> keep ON
+        if not triggered_now and hold_left > 0:
+            alert = "ON"
+            reason = hold_reason
+            note_parts.append(f"holding ON ({hold_left} min left)")
+
+        # If ON due to hold, decrement hold after emitting ON
+        if alert == "ON" and reason in ("VERY_LOW_PERSIST", "LOW_PERSIST") and hold_left > 0:
+            hold_left -= 1
+            if hold_left == 0:
+                note_parts.append("hold completed -> next OFF unless retrigger")
 
         rows.append(
             RowOut(
@@ -195,7 +250,6 @@ def compute_table(spo2_raw: List[int]) -> pd.DataFrame:
         prev_e = e
 
     df = pd.DataFrame([r.__dict__ for r in rows])
-    # round for display only
     df["e"] = df["e"].round(4)
     df["ve"] = df["ve"].round(4)
     df["drop"] = df["drop"].round(4)
@@ -220,7 +274,7 @@ def main() -> None:
 
     st.caption("Enter a comma-separated SpO₂ series (max 100 points). Click the button to generate output.")
 
-    default_line = "92,91,90,89,88,90,91,92"
+    default_line = "93,91,90,89,88,89,89,91,92,89,90,91,92,91,89,90"
     series_text = st.text_input("SpO₂ series (comma-separated):", value=default_line)
 
     col1, col2 = st.columns([1, 3])
@@ -242,8 +296,6 @@ def main() -> None:
         series = series[:MAX_POINTS]
         st.warning(f"Input exceeded {MAX_POINTS} points; only the first {MAX_POINTS} were used.")
 
-    st.write(f"Parsed **{len(series)}** points (each point = **1 minute**).")
-
     df = compute_table(series)
     st.dataframe(df, use_container_width=True, hide_index=True)
 
@@ -251,13 +303,13 @@ def main() -> None:
     st.markdown("### Notes (E-based)")
     st.markdown(
         f"""
-- **Reason codes (locked):** `LIMIT_E0`, `DROP_EVENT`, `VERY_LOW_PERSIST`, `LOW_PERSIST`, `NO_TRIGGER`
-- **ON\\***: `LIMIT_E0` when **E = 0**.
-- **ON**: `DROP_EVENT` when **Drop > s** (s = {S_DROP:.2f}).
-- **ON**: `VERY_LOW_PERSIST` when **E ≤ {E_VLOW:.4f}** persists to the **3rd consecutive step** (trigger-only at the hit).
-- **ON**: `LOW_PERSIST` when **0 < E ≤ {E_LOW_MAX:.4f}** persists to the **5th consecutive step** (trigger-only at the hit).
-- Persistence resets when **E ≥ {E_RESET:.4f}** or **E = 0**.
-- **OFF**: `NO_TRIGGER`; `flat` in Note indicates **|vE| ≤ p** (p = {P_FLAT:.2f}).
+- **Reason codes:** `LIMIT_E0`, `DROP_EVENT`, `VERY_LOW_PERSIST`, `LOW_PERSIST`, `NO_TRIGGER`
+- **ON\\***: `LIMIT_E0` when **E = 0** (immediate override).
+- **ON (event):** `DROP_EVENT` when **Drop > s** (s = {S_DROP:.2f}).
+- **Persistence triggers:**  
+  - `VERY_LOW_PERSIST` triggers when very-low streak hits **{N_VLOW}**; then holds ON for **{HOLD_VLOW} minutes** (early OFF if E leaves very-low or E≥E_reset).  
+  - `LOW_PERSIST` triggers when low streak hits **{N_LOW}**; then holds ON for **{HOLD_LOW} minutes** (early OFF if E leaves low or E≥E_reset).
+- `flat` in Note indicates **|vE| ≤ p** (p = {P_FLAT:.2f}).
 """
     )
 
